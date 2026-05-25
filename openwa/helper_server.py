@@ -26,6 +26,35 @@ def load_options() -> dict[str, Any]:
         return {}
 
 
+def get_master_key() -> str:
+    """Retrieve the master API key from options or a persistent file, generating one if needed."""
+    options = load_options()
+    key = options.get("api_master_key", "")
+
+    # Use the key from options if it's set and not the default
+    if key and key != "CHANGE_ME_TO_A_LONG_RANDOM_SECRET":
+        return key
+
+    # Fallback to persistent file
+    key_file = Path("/data/master_key.txt")
+    if key_file.exists():
+        return key_file.read_text().strip()
+
+    # Generate a new secure random key
+    import secrets
+    import string
+    alphabet = string.ascii_letters + string.digits
+    new_key = "".join(secrets.choice(alphabet) for _ in range(32))
+
+    # Persist the generated key
+    try:
+        key_file.write_text(new_key)
+    except Exception as e:
+        print(f"[OpenWA Helper] Warning: Could not persist master key: {e}")
+
+    print(f"[OpenWA Helper] 🔑 Generated new Master Key: {new_key}")
+    return new_key
+
 def mask_value(value: str) -> str:
     """Mask sensitive values for display."""
     if not value:
@@ -141,8 +170,7 @@ class HelperHandler(BaseHTTPRequestHandler):
 
     def verify_auth(self) -> bool:
         """Verify the request has a valid master API key."""
-        options = load_options()
-        master_key = options.get("api_master_key", "")
+        master_key = get_master_key()
 
         if not master_key:
             return True
