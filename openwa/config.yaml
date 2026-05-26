@@ -1,5 +1,5 @@
 name: OpenWA
-version: "0.1.0"
+version: "0.2.0"
 slug: openwa
 description: Self-hosted OpenWA WhatsApp API gateway with Home Assistant helper endpoints
 url: https://github.com/nomi25home/homeassistant-openwa-addon
