@@ -238,6 +238,7 @@ def start_session_if_needed() -> None:
 
 class HelperHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+    def do_GET(self) -> None:
         """Handle GET."""
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
