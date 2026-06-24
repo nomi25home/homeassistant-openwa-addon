@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hmac
 import html
 import json
 import time
@@ -17,6 +18,18 @@ OPTIONS_PATH = Path("/data/options.json")
 OPENWA_BASE_URL = "http://127.0.0.1:2785"
 HELPER_PORT = 2786
 
+MASTER_KEY_FILE = Path("/data/master_key.txt")
+OPENWA_API_KEY_FILE = Path("/data/openwa_api_key.txt")
+# The raw key the engine itself seeded on first boot (auth.service writes it relative to cwd /app,
+# which is symlinked to /data/openwa). Used as a final fallback so the helper matches the engine
+# across upgrades from older add-on versions.
+ENGINE_SEEDED_KEY_FILE = Path("/data/openwa/.api-key")
+SESSION_ID_FILE = Path("/data/session_id.txt")
+PLACEHOLDER_KEY = "CHANGE_ME_TO_A_LONG_RANDOM_SECRET"
+# Home Assistant proxies Ingress requests from the Supervisor on the internal hassio network.
+# Requests from this address are already authenticated by the HA frontend.
+INGRESS_PROXY_IP = "172.30.32.2"
+
 
 def load_options() -> dict[str, Any]:
     """Load add-on options from disk."""
@@ -28,39 +41,45 @@ def load_options() -> dict[str, Any]:
     return {}
 
 
-def save_options(options: dict[str, Any]) -> None:
-    """Save add-on options to disk."""
-    try:
-        OPTIONS_PATH.write_text(json.dumps(options, indent=2), encoding="utf-8")
-    except Exception as e:
-        print(f"[OpenWA Helper] Error saving options: {e}")
-
-
 def get_master_key() -> str:
-    """Retrieve the master API key from options or a persistent file, generating one if needed."""
-    options = load_options()
-    key = options.get("api_master_key", "")
-
-    if key and key != "CHANGE_ME_TO_A_LONG_RANDOM_SECRET":
+    """Helper inbound key (port 2786). Option value wins; else the file run.sh persisted (run.sh is
+    the single source of truth and writes it before this process starts). Empty => auth fails closed."""
+    key = str(load_options().get("api_master_key") or "").strip()
+    if key and key != PLACEHOLDER_KEY:
         return key
+    if MASTER_KEY_FILE.exists():
+        return MASTER_KEY_FILE.read_text().strip()
+    return ""
 
-    key_file = Path("/data/master_key.txt")
-    if key_file.exists():
-        return key_file.read_text().strip()
 
-    import secrets
-    import string
+def get_engine_api_key() -> str:
+    """Native OpenWA key (port 2785). Option > the file run.sh persisted > the engine's own seeded key."""
+    key = str(load_options().get("openwa_api_key") or "").strip()
+    if key and key != PLACEHOLDER_KEY:
+        return key
+    if OPENWA_API_KEY_FILE.exists():
+        return OPENWA_API_KEY_FILE.read_text().strip()
+    if ENGINE_SEEDED_KEY_FILE.exists():
+        return ENGINE_SEEDED_KEY_FILE.read_text().strip()
+    return ""
 
-    alphabet = string.ascii_letters + string.digits
-    new_key = "".join(secrets.choice(alphabet) for _ in range(32))
 
+def get_session_id() -> str:
+    """Configured session id, else the auto-created one persisted by the helper."""
+    sid = str(load_options().get("session_id") or "").strip()
+    if sid:
+        return sid
+    if SESSION_ID_FILE.exists():
+        return SESSION_ID_FILE.read_text().strip()
+    return ""
+
+
+def save_session_id(session_id: str) -> None:
+    """Persist an auto-created session id (the Supervisor rewrites options.json on every start)."""
     try:
-        key_file.write_text(new_key)
+        SESSION_ID_FILE.write_text(session_id)
     except Exception as e:
-        print(f"[OpenWA Helper] Warning: Could not persist master key: {e}")
-
-    print(f"[OpenWA Helper] 🔑 Generated new Master Key: {new_key}")
-    return new_key
+        print(f"[OpenWA Helper] Error saving session_id: {e}")
 
 
 def mask_value(value: str) -> str:
@@ -164,12 +183,11 @@ def start_session_if_needed() -> bool:
         print("[OpenWA Helper] OpenWA API not healthy. Skipping session auto-start.")
         return False
 
-    options = load_options()
-    api_key = options.get("openwa_api_key", "")
-    session_id = options.get("session_id", "")
+    api_key = get_engine_api_key()
+    session_id = get_session_id()
 
     if not api_key:
-        print("[OpenWA Helper] No openwa_api_key configured. Skipping auto-start.")
+        print("[OpenWA Helper] No OpenWA API key available. Skipping auto-start.")
         return False
 
     if not session_id:
@@ -201,8 +219,7 @@ def start_session_if_needed() -> bool:
             return False
 
         print(f"[OpenWA Helper] New session created: {session_id}")
-        options["session_id"] = session_id
-        save_options(options)
+        save_session_id(session_id)
 
     try:
         status, _, body = openwa_request(
@@ -266,7 +283,10 @@ class HelperHandler(BaseHTTPRequestHandler):
 
     def read_json_body(self) -> dict[str, Any]:
         """Read JSON request body."""
-        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            return {}
         if length <= 0:
             return {}
 
@@ -282,14 +302,13 @@ class HelperHandler(BaseHTTPRequestHandler):
         return {}
 
     def verify_auth(self) -> bool:
-        """Verify the request has a valid master API key."""
-        master_key = get_master_key()
-
-        if not master_key:
+        """Allow Ingress requests (already authenticated by HA); otherwise require the master key."""
+        if self.client_address[0] == INGRESS_PROXY_IP:
             return True
 
-        key = self.headers.get("X-API-Key")
-        if key == master_key:
+        master_key = get_master_key()
+        key = self.headers.get("X-API-Key", "")
+        if master_key and hmac.compare_digest(key, master_key):
             return True
 
         self.send_json(401, {"error": "unauthorized", "message": "Invalid or missing X-API-Key header."})
@@ -297,6 +316,9 @@ class HelperHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         """Handle GET."""
+        if not self.verify_auth():
+            return
+
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
 
@@ -306,9 +328,6 @@ class HelperHandler(BaseHTTPRequestHandler):
 
         if path == "/qr":
             self.handle_qr()
-            return
-
-        if not self.verify_auth():
             return
 
         if path == "/health":
@@ -343,8 +362,8 @@ class HelperHandler(BaseHTTPRequestHandler):
     def handle_index(self) -> None:
         """Render simple status UI."""
         options = load_options()
-        api_key = options.get("openwa_api_key", "")
-        session_id = options.get("session_id", "")
+        api_key = get_engine_api_key()
+        session_id = get_session_id()
         recipients = options.get("recipients", [])
 
         health_status, _, health_body = openwa_request("GET", "/api/health")
@@ -425,9 +444,9 @@ class HelperHandler(BaseHTTPRequestHandler):
 
   <h2>Endpoints</h2>
   <ul>
-    <li><a href="/health">GET /health</a></li>
-    <li><a href="/sessions">GET /sessions</a></li>
-    <li><a href="/qr">GET /qr</a></li>
+    <li><a href="health">GET /health</a></li>
+    <li><a href="sessions">GET /sessions</a></li>
+    <li><a href="qr">GET /qr</a></li>
     <li><code>POST /send</code></li>
     <li><code>POST /send/primary</code></li>
     <li><code>POST /send/secondary</code></li>
@@ -470,8 +489,7 @@ class HelperHandler(BaseHTTPRequestHandler):
 
     def handle_sessions(self) -> None:
         """Return OpenWA sessions."""
-        options = load_options()
-        api_key = options.get("openwa_api_key", "")
+        api_key = get_engine_api_key()
 
         if not api_key:
             self.send_json(
@@ -492,17 +510,16 @@ class HelperHandler(BaseHTTPRequestHandler):
         self.send_bytes(status, headers.get("Content-Type", "application/json"), body)
 
     def handle_qr(self) -> None:
-        """Return or render QR for configured session."""
-        options = load_options()
-        api_key = options.get("openwa_api_key", "")
-        session_id = options.get("session_id", "")
+        """Return or render the QR for the configured session, polling until it is ready."""
+        api_key = get_engine_api_key()
+        session_id = get_session_id()
 
         if not api_key:
             self.send_json(
                 503,
                 {
                     "error": "missing_openwa_api_key",
-                    "message": "Set openwa_api_key in the add-on options.",
+                    "message": "No OpenWA API key available. Set openwa_api_key in the add-on options.",
                 },
             )
             return
@@ -510,8 +527,7 @@ class HelperHandler(BaseHTTPRequestHandler):
         if not session_id:
             print("[OpenWA Helper] /qr requested with no session_id. Attempting auto-session setup...")
             start_session_if_needed()
-            options = load_options()
-            session_id = options.get("session_id", "")
+            session_id = get_session_id()
 
         if not session_id:
             self.send_json(
@@ -526,23 +542,56 @@ class HelperHandler(BaseHTTPRequestHandler):
             )
             return
 
-        status, _, body = openwa_request(
-            "GET",
-            f"/api/sessions/{session_id}/qr",
-            api_key=api_key,
-        )
+        # Already linked? The engine reports the session as 'ready' (and /qr would 400). Surface that
+        # immediately. Also surface an engine auth failure clearly instead of a generic "not ready"
+        # (e.g. after an upgrade or key change — see the docs' key-rotation note).
+        s_status, _, s_body = openwa_request("GET", f"/api/sessions/{session_id}", api_key=api_key)
+        if s_status in (401, 403):
+            self.send_json(
+                502,
+                {
+                    "error": "engine_unauthorized",
+                    "message": "OpenWA rejected the API key. If you upgraded or changed openwa_api_key, see the key-rotation note in the docs.",
+                },
+            )
+            return
+        if s_status == 200:
+            try:
+                s_payload = json.loads(s_body.decode("utf-8"))
+            except Exception:
+                s_payload = {}
+            if isinstance(s_payload, dict) and s_payload.get("status") == "ready":
+                self.send_json(200, {"status": "ready", "message": "Session already linked; no QR needed."})
+                return
 
-        try:
-            payload = json.loads(body.decode("utf-8"))
-        except Exception:
-            self.send_bytes(status, "application/json", body)
+        # A freshly started session needs a few seconds before its QR is generated (the engine
+        # returns 400 until then). Poll briefly instead of surfacing the raw error.
+        status = 0
+        payload: dict[str, Any] | None = None
+        for _ in range(6):
+            status, _, body = openwa_request("GET", f"/api/sessions/{session_id}/qr", api_key=api_key)
+            try:
+                parsed = json.loads(body.decode("utf-8"))
+                payload = parsed if isinstance(parsed, dict) else None
+            except Exception:
+                payload = None
+
+            if payload and payload.get("qrCode"):
+                break
+
+            time.sleep(2)
+
+        if not (payload and payload.get("qrCode")):
+            self.send_json(
+                503,
+                {
+                    "error": "qr_not_ready",
+                    "message": "QR is not ready yet. Make sure the session is starting and reload in a few seconds.",
+                },
+            )
             return
 
-        qr_code = payload.get("qrCode")
-
-        if not qr_code:
-            self.send_json(status, payload)
-            return
+        qr_code = payload["qrCode"]
 
         html_body = f"""<!doctype html>
 <html>
@@ -563,8 +612,8 @@ class HelperHandler(BaseHTTPRequestHandler):
     def handle_send(self, alias: str | None = None) -> None:
         """Send a WhatsApp message."""
         options = load_options()
-        api_key = options.get("openwa_api_key", "")
-        session_id = options.get("session_id", "")
+        api_key = get_engine_api_key()
+        session_id = get_session_id()
 
         if not api_key or not session_id:
             self.send_json(

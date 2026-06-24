@@ -31,30 +31,77 @@ value = data.get(key, default_value)
 if value is None:
     value = default_value
 
-print(value)
+print(str(value).strip())
 PY
 }
 
-API_MASTER_KEY="$(read_option api_master_key "")"
+# Resolve a secret: use the configured value unless it is empty or the shipped placeholder;
+# otherwise reuse a persisted random key (generated once on first boot). This keeps the engine's
+# seeded key and the helper's key stable across restarts without ever shipping a real default secret.
+resolve_secret() {
+  local value="$1" file="$2" generated
+  if [ -n "$value" ] && [ "$value" != "CHANGE_ME_TO_A_LONG_RANDOM_SECRET" ]; then
+    printf '%s' "$value"
+    return 0
+  fi
+  if [ -s "$file" ]; then
+    cat "$file"
+    return 0
+  fi
+  generated="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')"
+  generated="${generated:0:32}"
+  ( umask 077; printf '%s' "$generated" >"$file" )
+  printf '%s' "$generated"
+}
+
+# Resolve the native engine key. The engine seeds its key only ONCE (on an empty DB), so to keep the
+# helper matching it across restarts AND upgrades, prefer in order: explicit option > our persisted
+# file > the raw key the engine already seeded on a prior boot (/data/openwa/.api-key) > a fresh key.
+resolve_engine_key() {
+  local opt="$1" generated
+  if [ -n "$opt" ] && [ "$opt" != "CHANGE_ME_TO_A_LONG_RANDOM_SECRET" ]; then
+    printf '%s' "$opt"
+    return 0
+  fi
+  if [ -s "/data/openwa_api_key.txt" ]; then
+    cat "/data/openwa_api_key.txt"
+    return 0
+  fi
+  if [ -s "${OPENWA_DATA_DIR}/.api-key" ]; then
+    cat "${OPENWA_DATA_DIR}/.api-key"
+    return 0
+  fi
+  generated="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')"
+  printf '%s' "${generated:0:32}"
+}
+
 LOG_LEVEL="$(read_option log_level "info")"
-OPENWA_API_KEY="$(read_option openwa_api_key "")"
 SESSION_ID="$(read_option session_id "")"
+
+# Native engine key (port 2785): used by the helper AND the companion HACS integration.
+OPENWA_API_KEY="$(resolve_engine_key "$(read_option openwa_api_key "")")"
+# Keep the file the helper reads in sync with the resolved key (single source of truth).
+( umask 077; printf '%s' "$OPENWA_API_KEY" >/data/openwa_api_key.txt )
+# Helper inbound key (port 2786, X-API-Key). The helper reads the same file.
+HELPER_MASTER_KEY="$(resolve_secret "$(read_option api_master_key "")" "/data/master_key.txt")"
 
 export NODE_ENV=production
 
-mkdir -p "${OPENWA_DATA_DIR}"
-
-# Persist OpenWA data across add-on restarts.
+# Persist OpenWA data across add-on restarts. Runs as root (the add-on overrides the upstream
+# entrypoint with ENTRYPOINT ["/run.sh"]), so it can rewrite /app/data freely.
 if [ ! -L "/app/data" ]; then
   mkdir -p /app
   rm -rf /app/data
   ln -s "${OPENWA_DATA_DIR}" /app/data
 fi
 
-# Ensure the native API uses the configured key.
-if [ -n "$OPENWA_API_KEY" ]; then
-  echo "API_KEY=${OPENWA_API_KEY}" > "${OPENWA_DATA_DIR}/.env.generated"
-fi
+# Chromium writes its config/cache under these XDG dirs (set as ENV in the base image). The upstream
+# entrypoint normally creates them; we replace it, so create them here or Chromium can crash at launch.
+mkdir -p "${XDG_CONFIG_HOME:-/tmp/.config}" "${XDG_CACHE_HOME:-/tmp/.cache}"
+
+# Clear stale Chromium singleton locks left by an unclean shutdown; otherwise a relinked session fails
+# to relaunch ("profile appears to be in use"). Safe: no Chromium is running this early.
+rm -f "${OPENWA_DATA_DIR}/sessions/"*/Singleton* 2>/dev/null || true
 
 export PORT=2785
 export LOG_LEVEL="${LOG_LEVEL}"
@@ -62,6 +109,8 @@ export LOG_LEVEL="${LOG_LEVEL}"
 export DATABASE_TYPE=sqlite
 export DATABASE_NAME="${OPENWA_DATA_DIR}/openwa.sqlite"
 export DATABASE_SYNCHRONIZE=false
+# Auth/audit DB (holds the seeded API key). Pin it onto the persistent volume explicitly.
+export MAIN_DATABASE_NAME="${OPENWA_DATA_DIR}/main.sqlite"
 
 export ENGINE_TYPE=whatsapp-web.js
 export SESSION_DATA_PATH="${OPENWA_DATA_DIR}/sessions"
@@ -71,35 +120,29 @@ export PUPPETEER_ARGS="--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-u
 export STORAGE_TYPE=local
 export STORAGE_LOCAL_PATH="${OPENWA_DATA_DIR}/media"
 
-export REDIS_ENABLED=false
-
 export WEBHOOK_TIMEOUT=10000
 export WEBHOOK_MAX_RETRIES=3
 export WEBHOOK_RETRY_DELAY=5000
 
-export RATE_LIMIT_TTL=60
-export RATE_LIMIT_MAX=100
-
-export PLUGINS_ENABLED=true
 export PLUGINS_DIR="${OPENWA_DATA_DIR}/plugins"
 
-export API_MASTER_KEY="${API_MASTER_KEY}"
+# Resume an already-linked session automatically after an add-on restart.
+export AUTO_START_SESSIONS=true
+
+# The engine seeds its native admin key from API_MASTER_KEY on first boot — seed it with the
+# native key the helper and companion integration use.
+export API_MASTER_KEY="${OPENWA_API_KEY}"
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  🟢 OpenWA Home Assistant Add-on"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-if [ -n "$OPENWA_API_KEY" ]; then
-  echo "  💡 Automated Setup:"
-  echo "  The add-on will automatically manage your session."
-  echo "  🔑 Session ID: ${SESSION_ID:-None (will be generated)}"
-  echo "  If this is your first time, please scan the QR code at:"
-  echo "  http://homeassistant.local:2786/qr"
-else
-  echo "  ⚠️  openwa_api_key is not configured."
-  echo "  Set openwa_api_key in the add-on options before using QR/session features."
-fi
-
+echo "  🔑 OpenWA native API key (port 2785, also for the companion integration):"
+echo "     ${OPENWA_API_KEY}"
+echo "  🔑 Helper API key (port 2786, send it as the X-API-Key header):"
+echo "     ${HELPER_MASTER_KEY}"
+echo "  🔗 Session ID: ${SESSION_ID:-auto (created on first QR scan)}"
+echo "  First time? Open the add-on Web UI (sidebar panel) and scan the QR code with"
+echo "  WhatsApp → Linked Devices → Link a Device."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 cleanup() {
@@ -127,18 +170,6 @@ start_openwa() {
 
   if [ -f "/app/dist/src/main.js" ]; then
     node /app/dist/src/main.js &
-    OPENWA_PID="$!"
-    return 0
-  fi
-
-  if [ -f "dist/main.js" ]; then
-    node dist/main.js &
-    OPENWA_PID="$!"
-    return 0
-  fi
-
-  if [ -f "dist/src/main.js" ]; then
-    node dist/src/main.js &
     OPENWA_PID="$!"
     return 0
   fi

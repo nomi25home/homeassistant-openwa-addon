@@ -1,32 +1,33 @@
 name: OpenWA
-version: "0.2.0"
+version: "0.3.0"
 slug: openwa
 description: Self-hosted OpenWA WhatsApp API gateway with Home Assistant helper endpoints
 url: https://github.com/nomi25home/homeassistant-openwa-addon
 arch:
   - amd64
+  - aarch64
 
 startup: application
 boot: auto
-init: false
-ingress: false
+init: true
+
+ingress: true
+ingress_port: 2786
+panel_icon: mdi:whatsapp
+panel_title: OpenWA
+
+watchdog: "http://[HOST]:[PORT:2785]/api/health"
 
 ports:
   2785/tcp: 2785
   2786/tcp: 2786
 
 ports_description:
-  2785/tcp: OpenWA native API
-  2786/tcp: OpenWA helper API and status UI
-
-webui: "http://[HOST]:[PORT:2786]/"
-
-map:
-  - type: addon_config
-    read_only: false
+  2785/tcp: OpenWA native API (for the companion HACS integration)
+  2786/tcp: OpenWA helper API (X-API-Key required); the status/QR UI is also on the Ingress panel
 
 options:
-  api_master_key: "CHANGE_ME_TO_A_LONG_RANDOM_SECRET"
+  api_master_key: ""
   openwa_api_key: ""
   session_id: ""
   log_level: "info"
@@ -37,9 +38,9 @@ options:
       chat_id: "15557654321@c.us"
 
 schema:
-  api_master_key: str
-  openwa_api_key: str
-  session_id: str
+  api_master_key: password?
+  openwa_api_key: password?
+  session_id: str?
   log_level: list(debug|info|warn|error)
   recipients:
     - name: str
