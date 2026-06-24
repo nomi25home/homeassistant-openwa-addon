@@ -39,22 +39,24 @@ For the companion HACS integration, use:
 
 Install the add-on and enter the following in the **Options** tab:
 
-- `openwa_api_key`: A secret key for the native OpenWA API.
-- `api_master_key`: A secret key for the helper API. If left as the default or blank, a secure random key is generated and printed in the logs.
-- `session_id`: Optional. Leave blank on first boot so the add-on can create a session automatically.
+- `openwa_api_key`: The native OpenWA API key (port `2785`). This is the key the helper **and** the companion HACS integration use. Leave it blank to have the add-on generate a strong key on first boot and print it in the log.
+- `api_master_key`: The helper API key (port `2786`, sent as the `X-API-Key` header). Leave it blank to have the add-on generate one and print it in the log.
+- `session_id`: Optional. Leave blank on first boot so the add-on can create and persist a session automatically.
 
-Restart the add-on after saving these options.
+Restart the add-on after saving these options. On first boot, **open the add-on log** to copy the generated `openwa_api_key` (needed for the companion integration) and `api_master_key`.
+
+> **Key rotation / upgrades:** OpenWA seeds its native key on the **first** boot only. If you leave `openwa_api_key` blank, the add-on automatically reuses the key the engine already holds, so upgrades and restarts keep working with no re-link. To deliberately **change** the key after the database exists, rotate it from the OpenWA dashboard, or delete `/data/openwa/main.sqlite` and `/data/openwa/.api-key` (this requires re-linking WhatsApp).
 
 ### 2. One-Time QR Linkage
 
 If this is your first time using the add-on:
 
 1. Wait for the add-on to start.
-2. Visit the QR page: `http://homeassistant.local:2786/qr`
+2. Open the add-on's **Web UI** (the OpenWA panel in the Home Assistant sidebar) and go to the QR page. (Direct access to `http://homeassistant.local:2786/qr` also works but requires the `X-API-Key` header.)
 3. Scan the code using **WhatsApp → Linked Devices → Link a Device**.
 4. Check the add-on logs or `GET /sessions` for the generated session ID.
 
-Once scanned, the session should persist across restarts.
+Once scanned, the session persists across restarts.
 
 ### 3. Configure the Companion HACS Integration
 
@@ -118,8 +120,8 @@ rest_command:
 
 ## 📖 Troubleshooting
 
-- **Blank API Docs Page**: If `http://[YOUR_IP]:2785/api/docs` is blank, ensure you have correctly set the `openwa_api_key` in options and restarted.
-- **401 Unauthorized**: Ensure you are using the correct key. `openwa_api_key` is for the native OpenWA API; `api_master_key` is for the helper server.
-- **QR Code Not Showing**: Restart the add-on, wait for OpenWA to become healthy, then open `http://homeassistant.local:2786/qr`.
-- **Missing Session ID**: Leave `session_id` blank on first boot so the add-on can auto-create it. If it still fails, check the add-on logs for OpenWA health or session creation errors.
-- **Session Lost on Restart**: This add-on implements persistence. If you are asked to scan the QR code after every restart, check that the add-on data directory is being preserved.
+- **Blank API Docs Page**: OpenWA disables Swagger (`/api/docs`) in production by default, so a blank page at `http://[YOUR_IP]:2785/api/docs` is expected. The API itself still works.
+- **401 Unauthorized**: Use the right key for the right port. The native OpenWA API (`2785`) and the helper (`2786`) both expect `openwa_api_key` / `api_master_key` respectively — copy the exact values from the add-on log. If you changed `openwa_api_key` after the first boot, see the key-rotation note above (the engine only seeds its key once).
+- **QR Code Not Showing**: Open the add-on Web UI (sidebar panel). The QR page polls until the code is ready; if it reports "not ready", wait a few seconds and reload. Confirm OpenWA is healthy in the log first.
+- **Missing Session ID**: Leave `session_id` blank on first boot so the add-on can auto-create it. The generated ID is persisted to `/data/session_id.txt` and shown in the log.
+- **Session Lost on Restart**: The session ID is persisted outside `options.json` and the WhatsApp auth lives in the add-on data directory, so a linked session should survive restarts. If you must re-scan every restart, verify the add-on's data directory is preserved.

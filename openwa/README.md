@@ -11,7 +11,7 @@ Runs OpenWA inside Home Assistant OS/Supervised and exposes:
 - OpenWA API on port `2785`
 - Helper API/UI on port `2786`
 
-The helper API provides simplified Home Assistant-friendly endpoints. All helper endpoints require the `api_master_key` to be passed in the `X-API-Key` header:
+The status/QR UI is also available through the Home Assistant Ingress panel (no extra auth needed). When the helper API is accessed directly on port `2786`, all endpoints require the `api_master_key` in the `X-API-Key` header:
 
 - `GET /`
 - `GET /health`
