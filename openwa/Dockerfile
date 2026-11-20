@@ -13,8 +13,11 @@ RUN apt-get update \
 
 COPY run.sh /run.sh
 COPY helper_server.py /usr/local/bin/helper_server.py
+COPY fix-options-perms.sh /fix-options-perms.sh
 
 RUN chmod a+x /run.sh \
-    && chmod a+x /usr/local/bin/helper_server.py
+    && chmod a+x /usr/local/bin/helper_server.py \
+    && chmod a+x /fix-options-perms.sh
 
+ENTRYPOINT ["/fix-options-perms.sh"]
 CMD ["/run.sh"]
