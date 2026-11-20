@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hmac
 import html
 import json
 import time
@@ -288,8 +289,8 @@ class HelperHandler(BaseHTTPRequestHandler):
         if not master_key:
             return True
 
-        key = self.headers.get("X-API-Key")
-        if key == master_key:
+        key = self.headers.get("X-API-Key") or ""
+        if hmac.compare_digest(key, master_key):
             return True
 
         self.send_json(401, {"error": "unauthorized", "message": "Invalid or missing X-API-Key header."})
@@ -300,15 +301,15 @@ class HelperHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
 
+        if not self.verify_auth():
+            return
+
         if path == "/":
             self.handle_index()
             return
 
         if path == "/qr":
             self.handle_qr()
-            return
-
-        if not self.verify_auth():
             return
 
         if path == "/health":
