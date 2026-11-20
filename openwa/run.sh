@@ -44,13 +44,6 @@ export NODE_ENV=production
 
 mkdir -p "${OPENWA_DATA_DIR}"
 
-# Persist OpenWA data across add-on restarts.
-if [ ! -L "/app/data" ]; then
-  mkdir -p /app
-  rm -rf /app/data
-  ln -s "${OPENWA_DATA_DIR}" /app/data
-fi
-
 # Ensure the native API uses the configured key.
 if [ -n "$OPENWA_API_KEY" ]; then
   echo "API_KEY=${OPENWA_API_KEY}" > "${OPENWA_DATA_DIR}/.env.generated"
